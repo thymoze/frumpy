@@ -62,13 +62,13 @@ impl Grid {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RawConnection {
     Unknown(Position),
-    Unconnected(Direction),
-    Connected {
-        from_dir: Direction,
-        to: usize,
-        to_dir: Direction,
-        kind: ConnectionKind,
-    },
+    // Unconnected(Direction),
+    // Connected {
+    //     from_dir: Direction,
+    //     to: usize,
+    //     to_dir: Direction,
+    //     kind: ConnectionKind,
+    // },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +169,7 @@ enum ErrorKind {
     UnexpectedLineType(Position, char),
     UnexpectedConnection(Position),
     UnresolvedConnection(Position),
+    UnconnectedInput(Position, Direction),
     MalformedBox(Position),
 
     MissingFunctionReturn(String, Position),

@@ -1,4 +1,13 @@
-use std::iter::repeat;
+use std::{
+    array,
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    hash::Hash,
+    io,
+    iter::repeat,
+};
+
+use slab::Slab;
 
 use crate::parser::{Connections, Direction, ErrorKind, Grid, Position, RawConnection};
 
@@ -21,7 +30,47 @@ pub(crate) struct RawBox {
     pub(crate) top_left: Position,
     pub(crate) bottom_right: Position,
     pub(crate) content: String,
-    pub(crate) connections: Connections<RawConnection>,
+    pub(crate) connections: Connections<Position>,
+}
+
+fn is_in_box(pos: Position, top_left: Position, bottom_right: Position) -> bool {
+    pos.0 >= top_left.0 && pos.0 <= bottom_right.0 && pos.1 >= top_left.1 && pos.1 <= bottom_right.1
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IO {
+    Input,
+    Output,
+}
+
+impl IO {
+    fn rev(&self) -> Self {
+        match self {
+            IO::Input => IO::Output,
+            IO::Output => IO::Input,
+        }
+    }
+}
+
+struct Return {
+    from: usize,
+    from_dir: Direction,
+    return_dir: Direction,
+}
+impl Return {
+    fn new(from: usize, from_dir: Direction, return_dir: Direction) -> Self {
+        Self {
+            from,
+            from_dir,
+            return_dir,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Function {
+    declaration: usize,
+    connections: Connections<(usize, IO)>,
 }
 
 #[derive(Debug)]
@@ -29,10 +78,10 @@ pub(crate) struct BoxParser<'src> {
     // TODO: source could be removed
     source: &'src str,
     pub(crate) grid: Grid,
-}
-
-fn is_in_box(pos: Position, top_left: Position, bottom_right: Position) -> bool {
-    pos.0 >= top_left.0 && pos.0 <= bottom_right.0 && pos.1 >= top_left.1 && pos.1 <= bottom_right.1
+    boxes: Slab<RawBox>,
+    connectors: HashMap<(Position, Direction), usize>,
+    connections: RefCell<HashMap<(usize, Direction), IO>>,
+    functions: HashMap<String, Function>,
 }
 
 impl<'src> BoxParser<'src> {
@@ -40,125 +89,271 @@ impl<'src> BoxParser<'src> {
         Self {
             source,
             grid: Grid::new(source),
+            boxes: Slab::new(),
+            connectors: HashMap::new(),
+            connections: RefCell::new(HashMap::new()),
+            functions: HashMap::new(),
         }
     }
 
-    pub(crate) fn parse(&self) -> Result<Vec<RawBox>, Vec<ErrorKind>> {
-        let mut boxes = self.parse_tokens()?;
+    pub(crate) fn parse(&mut self) -> Result<(), Vec<ErrorKind>> {
+        self.parse_tokens()?;
 
-        self.trace_connections(&mut boxes)?;
+        self.trace_connections()?;
 
-        self.identify_connections(&mut boxes)?;
+        // self.identify_connections(&mut boxes)?;
 
-        Ok(boxes)
+        Ok(())
     }
 
-    fn identify_connections(&self, boxes: &mut Vec<RawBox>) -> Result<(), Vec<ErrorKind>> {
-        let mut done = false;
-        while !done {
-            done = true;
-            for i in (0..boxes.len()) {
-                for (dir, c) in boxes[i].connections.iter() {
-                    match c {
-                        RawConnection::Connected {
-                            from_dir,
-                            to,
-                            to_dir,
-                            kind: ConnectionKind::Unknown,
-                        } => {
-                            done = false;
+    fn trace_function(&mut self, declaration: usize) -> Result<(), ErrorKind> {
+        let mut visited = HashSet::new();
+        let mut stack = vec![declaration];
+
+        let mut returns = HashMap::new();
+
+        while let Some(current) = stack.pop() {
+            if !visited.insert(current) {
+                continue;
+            }
+
+            for (conn_dir, conn) in self.boxes[current].connections.iter() {
+                match conn {
+                    RawConnection::Connected(next, _) => {
+                        if !visited.contains(next) {
+                            stack.push(*next);
                         }
-                        _ => continue,
                     }
+                    RawConnection::Unconnected(dir) => {
+                        if func.connections.iter().any(|(d, _)| d.rotate_n(2) == *dir)
+                            || returns.insert(*dir, (current, conn_dir)).is_some()
+                        {
+                            return Err(ErrorKind::ConflictingFunctionReturn(
+                                func.content.clone(),
+                                *dir,
+                            ));
+                        }
+                    }
+                    _ => (),
                 }
             }
         }
 
-        Ok(())
+        if returns.is_empty() {
+            return Err(ErrorKind::MissingFunctionReturn(
+                func.content.clone(),
+                func.top_left,
+            ));
+        }
+
+        Ok((visited.into_iter().collect(), returns))
     }
 
-    fn trace_connections(&self, boxes: &mut Vec<RawBox>) -> Result<(), Vec<ErrorKind>> {
-        for i in 0..boxes.len() {
-            let traced_connections = boxes[i]
-                .connections
-                .iter()
-                .filter_map(|(dir, &conn)| {
-                    if let RawConnection::Unknown(from) = conn {
-                        let end = self.trace_line(from, dir);
-                        Some((dir, end))
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
+    fn insert_connection(&self, id: usize, dir: Direction, pos: Position, io: IO) {
+        let mut connections = self.connections.borrow_mut();
+        if !connections.contains_key(&(id, dir)) {
+            connections.insert((id, dir), io);
 
-            for (dir, end) in traced_connections {
-                if let Some(end_pos) = end.0 {
-                    let index = boxes
+            let (end_pos, end_dir) = self.trace_line(pos, dir);
+            if let Some(end_pos) = end_pos {
+                let end_id = *self
+                    .connectors
+                    .get(&(end_pos, end_dir))
+                    .expect("end position must have a connector");
+                connections.insert((end_id, end_dir), io.rev());
+            }
+        }
+    }
+
+    fn trace_connections(&mut self) -> Result<(), Vec<ErrorKind>> {
+        // from (usize, Dir) -> to (usize, Dir)
+        // let mut connections = HashMap::new();
+        // let mut io = HashMap::new();
+        // let mut returns = Vec::new();
+
+        for (id, bx) in self.boxes.iter() {
+            match bx.shape {
+                RawBoxKind::Box4 | RawBoxKind::Box2Opposing => {
+                    // All connections are outputs
+                    for (dir, &pos) in bx.connections.iter() {
+                        self.insert_connection(id, dir, pos, IO::Output);
+                    }
+                }
+                RawBoxKind::Tee => {
+                    for (dir, &pos) in bx.connections.iter() {
+                        if let Some(io) = self.connections.borrow().get(&(id, dir)).cloned() {
+                            let opposite_dir = dir.rotate_n(2);
+                            if bx.connections.at(opposite_dir).is_some() {
+                                self.insert_connection(id, opposite_dir, pos, io);
+
+                                if bx.connections.at(dir.rotate_n(1)).is_some() {
+                                    self.insert_connection(id, dir.rotate_n(1), pos, io.rev());
+                                } else if bx.connections.at(dir.rotate_n(-1)).is_some() {
+                                    self.insert_connection(id, dir.rotate_n(-1), pos, io.rev());
+                                } else {
+                                    panic!()
+                                }
+                            } else {
+                                self.insert_connection(id, dir.rotate_n(1), pos, io.rev());
+                                self.insert_connection(id, dir.rotate_n(-1), pos, io.rev());
+                            }
+                            break;
+                        }
+                    }
+                }
+                RawBoxKind::Cross => {
+                    for (dir, &pos) in bx.connections.iter() {
+                        if let Some(io) = self.connections.borrow().get(&(id, dir)).cloned() {
+                            self.insert_connection(id, dir.rotate_n(2), pos, io);
+                        }
+                    }
+                }
+                RawBoxKind::Box2Adjacent => {
+                    let declaration = self
+                        .boxes
                         .iter()
-                        .position(|b| is_in_box(end_pos, b.top_left, b.bottom_right))
-                        .expect("all boxes have been found");
-                    boxes[i].connections.update(
-                        dir,
-                        RawConnection::Connected {
-                            from_dir: dir,
-                            to: index,
-                            to_dir: end.1,
-                            kind: ConnectionKind::Unknown,
-                        },
-                    );
-                    boxes[index].connections.update(
-                        end.1,
-                        RawConnection::Connected {
-                            from_dir: end.1,
-                            to: i,
-                            to_dir: dir,
-                            kind: ConnectionKind::Unknown,
-                        },
-                    );
-                } else {
-                    boxes[i]
-                        .connections
-                        .update(dir, RawConnection::Unconnected(end.1));
+                        .find(|&(decl_id, decl_bx)| id != decl_id && bx.content == decl_bx.content);
                 }
+                RawBoxKind::Box1 => {}
+                RawBoxKind::Box3 => {}
             }
-        }
 
-        if let Some(((_, RawConnection::Unknown(position)))) = boxes.iter().find_map(|b| {
-            b.connections
-                .iter()
-                .find(|(_, conn)| matches!(conn, RawConnection::Unknown(_)))
-        }) {
-            return Err(vec![ErrorKind::UnresolvedConnection(*position)]);
+            // let RawConnection::Unknown(from) = conn;
+            // let (end_pos, end_dir) = self.trace_line(from, dir);
+
+            // if let Some(end_pos) = end_pos {
+            //     let end_index = boxes
+            //         .iter()
+            //         .position(|b| is_in_box(end_pos, b.top_left, b.bottom_right))
+            //         .expect("all boxes have been found");
+            // } else {
+            //     returns.push(Return::new(i, dir, end_dir))
+            // }
         }
 
         Ok(())
     }
 
-    fn parse_tokens(&self) -> Result<Vec<RawBox>, Vec<ErrorKind>> {
-        let mut boxes: Vec<RawBox> = Vec::new();
+    fn insert_connected(
+        &self,
+        boxes: &Vec<RawBox>,
+        io: &mut HashMap<(usize, Direction), IO>,
+        returns: &mut Vec<Return>,
+        from: Position,
+        from_id: usize,
+        from_dir: Direction,
+        from_io: IO,
+    ) -> Result<(), ErrorKind> {
+        io.insert((from_id, from_dir), from_io);
+        let (end_pos, end_dir) = self.trace_line(from, from_dir);
+
+        if let Some(end_pos) = end_pos {
+            let end_index = boxes
+                .iter()
+                .position(|b| is_in_box(end_pos, b.top_left, b.bottom_right))
+                .expect("all boxes have been found");
+            match from_io {
+                IO::Input => io.insert((end_index, end_dir), IO::Output),
+                IO::Output => io.insert((end_index, end_dir), IO::Input),
+            };
+        } else {
+            match from_io {
+                IO::Output => returns.push(Return::new(from_id, from_dir, end_dir)),
+                IO::Input => return Err(ErrorKind::UnconnectedInput(from, from_dir)),
+            }
+        }
+
+        Ok(())
+    }
+
+    // fn trace_connections_old(&self, boxes: &mut Vec<RawBox>) -> Result<(), Vec<ErrorKind>> {
+    //     for i in 0..boxes.len() {
+    //         let traced_connections = boxes[i]
+    //             .connections
+    //             .iter()
+    //             .filter_map(|(dir, &conn)| {
+    //                 if let RawConnection::Unknown(from) = conn {
+    //                     let end = self.trace_line(from, dir);
+    //                     Some((dir, end))
+    //                 } else {
+    //                     None
+    //                 }
+    //             })
+    //             .collect::<Vec<_>>();
+
+    //         for (dir, end) in traced_connections {
+    //             if let Some(end_pos) = end.0 {
+    //                 let index = boxes
+    //                     .iter()
+    //                     .position(|b| is_in_box(end_pos, b.top_left, b.bottom_right))
+    //                     .expect("all boxes have been found");
+    //                 boxes[i].connections.update(
+    //                     dir,
+    //                     RawConnection::Connected {
+    //                         from_dir: dir,
+    //                         to: index,
+    //                         to_dir: end.1,
+    //                         kind: ConnectionKind::Unknown,
+    //                     },
+    //                 );
+    //                 boxes[index].connections.update(
+    //                     end.1,
+    //                     RawConnection::Connected {
+    //                         from_dir: end.1,
+    //                         to: i,
+    //                         to_dir: dir,
+    //                         kind: ConnectionKind::Unknown,
+    //                     },
+    //                 );
+    //             } else {
+    //                 boxes[i]
+    //                     .connections
+    //                     .update(dir, RawConnection::Unconnected(end.1));
+    //             }
+    //         }
+    //     }
+
+    //     if let Some(((_, RawConnection::Unknown(position)))) = boxes.iter().find_map(|b| {
+    //         b.connections
+    //             .iter()
+    //             .find(|(_, conn)| matches!(conn, RawConnection::Unknown(_)))
+    //     }) {
+    //         return Err(vec![ErrorKind::UnresolvedConnection(*position)]);
+    //     }
+
+    //     Ok(())
+    // }
+
+    fn parse_tokens(&mut self) -> Result<(), Vec<ErrorKind>> {
         let mut errors = Vec::new();
 
         for (pos, c) in self.grid.iter() {
             match c {
                 '╓' | '╒' | '┌' | '╔' => match self.trace_box(pos) {
                     Ok(Some(bx)) => {
-                        boxes.push(bx);
+                        let entry = self.boxes.vacant_entry();
+                        for (dir, &pos) in bx.connections.iter() {
+                            self.connectors.insert((pos, dir), entry.key());
+                        }
+                        entry.insert(bx);
                     }
                     Ok(None) => {}
                     Err(e) => errors.push(e),
                 },
 
                 tee @ ('┴' | '├' | '┬' | '┤') => {
-                    let conn = Some(RawConnection::Unknown(pos));
                     let connections = match tee {
-                        '┬' => Connections::with(None, conn, conn, conn),
-                        '┤' => Connections::with(conn, None, conn, conn),
-                        '┴' => Connections::with(conn, conn, None, conn),
-                        '├' => Connections::with(conn, conn, conn, None),
+                        '┬' => Connections::with(None, Some(pos), Some(pos), Some(pos)),
+                        '┤' => Connections::with(Some(pos), None, Some(pos), Some(pos)),
+                        '┴' => Connections::with(Some(pos), Some(pos), None, Some(pos)),
+                        '├' => Connections::with(Some(pos), Some(pos), Some(pos), None),
                         _ => unreachable!(),
                     };
-                    boxes.push(RawBox {
+                    let entry = self.boxes.vacant_entry();
+                    for (dir, &pos) in connections.iter() {
+                        self.connectors.insert((pos, dir), entry.key());
+                    }
+                    entry.insert(RawBox {
                         shape: RawBoxKind::Tee,
                         top_left: pos,
                         bottom_right: pos,
@@ -167,20 +362,25 @@ impl<'src> BoxParser<'src> {
                     });
                 }
                 '┼' => {
-                    let conn = Some(RawConnection::Unknown(pos));
-                    boxes.push(RawBox {
+                    let connections = Connections::with(Some(pos), Some(pos), Some(pos), Some(pos));
+                    let entry = self.boxes.vacant_entry();
+                    for (dir, &pos) in connections.iter() {
+                        self.connectors.insert((pos, dir), entry.key());
+                    }
+                    entry.insert(RawBox {
                         shape: RawBoxKind::Cross,
                         top_left: pos,
                         bottom_right: pos,
                         content: String::new(),
-                        connections: Connections::with(conn, conn, conn, conn),
+                        connections,
                     });
                 }
                 '─' | '│' | '┌' | '┐' | '└' | '┘' | ' ' => continue,
                 _ => {
-                    if !boxes
+                    if !self
+                        .boxes
                         .iter()
-                        .any(|bx| is_in_box(pos, bx.top_left, bx.bottom_right))
+                        .any(|(_, bx)| is_in_box(pos, bx.top_left, bx.bottom_right))
                     {
                         errors.push(ErrorKind::UnexpectedCharacter(pos, c));
                     }
@@ -192,28 +392,26 @@ impl<'src> BoxParser<'src> {
             return Err(errors);
         }
 
-        let mut to_remove = Vec::new();
-        for (i, b) in boxes.iter().enumerate() {
+        let mut to_remove = HashSet::new();
+        for (i, b) in self.boxes.iter() {
             if b.connections.iter().next().is_none() {
                 // This box is a comment
-                to_remove.push(i);
-                continue;
-            }
-
-            if boxes
+                to_remove.insert(i);
+            } else if self
+                .boxes
                 .iter()
-                .any(|bx| b != bx && is_in_box(b.top_left, bx.top_left, bx.bottom_right))
+                .any(|(_, bx)| b != bx && is_in_box(b.top_left, bx.top_left, bx.bottom_right))
             {
                 // This box is inside another box
-                to_remove.push(i);
-                continue;
+                to_remove.insert(i);
             }
         }
-        for i in to_remove.into_iter().rev() {
-            boxes.remove(i);
+        for &id in &to_remove {
+            self.boxes.remove(id);
         }
+        self.connectors.retain(|_, id| !to_remove.contains(id));
 
-        Ok(boxes)
+        Ok(())
     }
 
     fn trace_box(&self, top_left: Position) -> Result<Option<RawBox>, ErrorKind> {
@@ -241,25 +439,25 @@ impl<'src> BoxParser<'src> {
                     if connections.north().is_some() {
                         return Err(ErrorKind::UnexpectedConnection(pos));
                     }
-                    connections = connections.set(Direction::North, RawConnection::Unknown(pos));
+                    connections = connections.set(Direction::North, pos);
                 }
                 '├' | '╟' if dir == Direction::South => {
                     if connections.east().is_some() {
                         return Err(ErrorKind::UnexpectedConnection(pos));
                     }
-                    connections = connections.set(Direction::East, RawConnection::Unknown(pos));
+                    connections = connections.set(Direction::East, pos);
                 }
                 '┬' | '╤' if dir == Direction::West => {
                     if connections.south().is_some() {
                         return Err(ErrorKind::UnexpectedConnection(pos));
                     }
-                    connections = connections.set(Direction::South, RawConnection::Unknown(pos));
+                    connections = connections.set(Direction::South, pos);
                 }
                 '┤' | '╢' if dir == Direction::North => {
                     if connections.west().is_some() {
                         return Err(ErrorKind::UnexpectedConnection(pos));
                     }
-                    connections = connections.set(Direction::West, RawConnection::Unknown(pos));
+                    connections = connections.set(Direction::West, pos);
                 }
 
                 // Sanity check edges
