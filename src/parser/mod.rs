@@ -163,6 +163,15 @@ impl<T> FromIterator<Option<T>> for Connections<T> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Connection(usize, usize);
+
+impl Connection {
+    pub(crate) fn new(a: usize, b: usize) -> Self {
+        if a < b { Self(a, b) } else { Self(b, a) }
+    }
+}
+
 #[derive(Debug)]
 enum ErrorKind {
     UnexpectedCharacter(Position, char),
@@ -171,7 +180,7 @@ enum ErrorKind {
     UnresolvedConnection(Position),
     UnconnectedInput(Position, Direction),
     MalformedBox(Position),
-
+    InvalidNumberOfProgramReturns(usize),
     MissingFunctionReturn(String, Position),
     ConflictingFunctionReturn(String, Direction),
     InvalidFnReturn(String, Direction),

@@ -9,7 +9,9 @@ use std::{
 
 use slab::Slab;
 
-use crate::parser::{Connections, Direction, ErrorKind, Grid, Position, RawConnection};
+use crate::parser::{
+    Connection, Connections, Direction, ErrorKind, Grid, Position, RawConnection, elements::Element,
+};
 
 use super::ConnectionKind;
 
@@ -52,6 +54,7 @@ impl IO {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 struct Return {
     from: usize,
     from_dir: Direction,
@@ -70,7 +73,7 @@ impl Return {
 #[derive(Debug)]
 struct Function {
     declaration: usize,
-    connections: Connections<(usize, IO)>,
+    returns: Vec<Return>,
 }
 
 #[derive(Debug)]
@@ -80,8 +83,15 @@ pub(crate) struct BoxParser<'src> {
     pub(crate) grid: Grid,
     boxes: Slab<RawBox>,
     connectors: HashMap<(Position, Direction), usize>,
-    connections: RefCell<HashMap<(usize, Direction), IO>>,
-    functions: HashMap<String, Function>,
+    connections: RefCell<HashSet<(usize, usize)>>,
+    free_returns: Vec<Return>,
+    functions: RefCell<HashMap<String, Function>>,
+    elements: Slab<Element>,
+    // connections: RefCell<HashMap<(usize, Direction), IO>>,
+}
+
+struct Ast {
+    functions: HashMap<String, Element>,
 }
 
 impl<'src> BoxParser<'src> {
@@ -91,147 +101,137 @@ impl<'src> BoxParser<'src> {
             grid: Grid::new(source),
             boxes: Slab::new(),
             connectors: HashMap::new(),
-            connections: RefCell::new(HashMap::new()),
-            functions: HashMap::new(),
+            connections: RefCell::new(HashSet::new()),
+            free_returns: Vec::new(),
+            functions: RefCell::new(HashMap::new()),
+            elements: Slab::new(),
+            // connections: RefCell::new(HashMap::new()),
         }
     }
 
     pub(crate) fn parse(&mut self) -> Result<(), Vec<ErrorKind>> {
         self.parse_tokens()?;
+        self.trace_connections();
+        self.trace_functions().map_err(|e| vec![e])?;
+        if self.free_returns.len() != 1 {
+            return Err(vec![ErrorKind::InvalidNumberOfProgramReturns(
+                self.free_returns.len(),
+            )]);
+        }
 
-        self.trace_connections()?;
+        // self.identify_connections();
 
-        // self.identify_connections(&mut boxes)?;
+        println!("{self:?}");
 
         Ok(())
     }
 
-    fn trace_function(&mut self, declaration: usize) -> Result<(), ErrorKind> {
-        let mut visited = HashSet::new();
-        let mut stack = vec![declaration];
+    fn trace_functions(&mut self) -> Result<(), ErrorKind> {
+        for (id, bx) in self
+            .boxes
+            .iter()
+            .filter(|(_, bx)| matches!(bx.shape, RawBoxKind::Box2Opposing))
+        {
+            let mut visited = HashSet::new();
+            let mut stack = vec![id];
 
-        let mut returns = HashMap::new();
+            let mut returns = Vec::new();
 
-        while let Some(current) = stack.pop() {
-            if !visited.insert(current) {
-                continue;
-            }
-
-            for (conn_dir, conn) in self.boxes[current].connections.iter() {
-                match conn {
-                    RawConnection::Connected(next, _) => {
-                        if !visited.contains(next) {
-                            stack.push(*next);
-                        }
-                    }
-                    RawConnection::Unconnected(dir) => {
-                        if func.connections.iter().any(|(d, _)| d.rotate_n(2) == *dir)
-                            || returns.insert(*dir, (current, conn_dir)).is_some()
-                        {
-                            return Err(ErrorKind::ConflictingFunctionReturn(
-                                func.content.clone(),
-                                *dir,
-                            ));
-                        }
-                    }
-                    _ => (),
+            while let Some(current) = stack.pop() {
+                if !visited.insert(current) {
+                    continue;
                 }
-            }
-        }
 
-        if returns.is_empty() {
-            return Err(ErrorKind::MissingFunctionReturn(
-                func.content.clone(),
-                func.top_left,
-            ));
-        }
-
-        Ok((visited.into_iter().collect(), returns))
-    }
-
-    fn insert_connection(&self, id: usize, dir: Direction, pos: Position, io: IO) {
-        let mut connections = self.connections.borrow_mut();
-        if !connections.contains_key(&(id, dir)) {
-            connections.insert((id, dir), io);
-
-            let (end_pos, end_dir) = self.trace_line(pos, dir);
-            if let Some(end_pos) = end_pos {
-                let end_id = *self
-                    .connectors
-                    .get(&(end_pos, end_dir))
-                    .expect("end position must have a connector");
-                connections.insert((end_id, end_dir), io.rev());
-            }
-        }
-    }
-
-    fn trace_connections(&mut self) -> Result<(), Vec<ErrorKind>> {
-        // from (usize, Dir) -> to (usize, Dir)
-        // let mut connections = HashMap::new();
-        // let mut io = HashMap::new();
-        // let mut returns = Vec::new();
-
-        for (id, bx) in self.boxes.iter() {
-            match bx.shape {
-                RawBoxKind::Box4 | RawBoxKind::Box2Opposing => {
-                    // All connections are outputs
-                    for (dir, &pos) in bx.connections.iter() {
-                        self.insert_connection(id, dir, pos, IO::Output);
-                    }
-                }
-                RawBoxKind::Tee => {
-                    for (dir, &pos) in bx.connections.iter() {
-                        if let Some(io) = self.connections.borrow().get(&(id, dir)).cloned() {
-                            let opposite_dir = dir.rotate_n(2);
-                            if bx.connections.at(opposite_dir).is_some() {
-                                self.insert_connection(id, opposite_dir, pos, io);
-
-                                if bx.connections.at(dir.rotate_n(1)).is_some() {
-                                    self.insert_connection(id, dir.rotate_n(1), pos, io.rev());
-                                } else if bx.connections.at(dir.rotate_n(-1)).is_some() {
-                                    self.insert_connection(id, dir.rotate_n(-1), pos, io.rev());
-                                } else {
-                                    panic!()
-                                }
-                            } else {
-                                self.insert_connection(id, dir.rotate_n(1), pos, io.rev());
-                                self.insert_connection(id, dir.rotate_n(-1), pos, io.rev());
-                            }
-                            break;
-                        }
-                    }
-                }
-                RawBoxKind::Cross => {
-                    for (dir, &pos) in bx.connections.iter() {
-                        if let Some(io) = self.connections.borrow().get(&(id, dir)).cloned() {
-                            self.insert_connection(id, dir.rotate_n(2), pos, io);
-                        }
-                    }
-                }
-                RawBoxKind::Box2Adjacent => {
-                    let declaration = self
-                        .boxes
+                stack.extend(
+                    self.connections
+                        .borrow()
                         .iter()
-                        .find(|&(decl_id, decl_bx)| id != decl_id && bx.content == decl_bx.content);
-                }
-                RawBoxKind::Box1 => {}
-                RawBoxKind::Box3 => {}
+                        .filter(|(from, _)| *from == current)
+                        .filter(|(_, to)| !visited.contains(to))
+                        .map(|(_, to)| *to),
+                );
+
+                self.free_returns.retain(|ret| {
+                    if ret.from == current {
+                        returns.push(*ret);
+                        false
+                    } else {
+                        true
+                    }
+                });
             }
 
-            // let RawConnection::Unknown(from) = conn;
-            // let (end_pos, end_dir) = self.trace_line(from, dir);
+            if returns.is_empty() {
+                return Err(ErrorKind::MissingFunctionReturn(
+                    bx.content.clone(),
+                    bx.top_left,
+                ));
+            }
 
-            // if let Some(end_pos) = end_pos {
-            //     let end_index = boxes
-            //         .iter()
-            //         .position(|b| is_in_box(end_pos, b.top_left, b.bottom_right))
-            //         .expect("all boxes have been found");
-            // } else {
-            //     returns.push(Return::new(i, dir, end_dir))
-            // }
+            let mut return_dirs = HashSet::new();
+            for r in &returns {
+                if !return_dirs.insert(r.return_dir) {
+                    return Err(ErrorKind::ConflictingFunctionReturn(
+                        bx.content.clone(),
+                        r.return_dir,
+                    ));
+                }
+            }
+            for (arg_dir, _) in bx.connections.iter() {
+                if return_dirs.contains(&arg_dir.rotate_n(2)) {
+                    return Err(ErrorKind::ConflictingFunctionReturn(
+                        bx.content.clone(),
+                        arg_dir.rotate_n(2),
+                    ));
+                }
+            }
+
+            self.functions.borrow_mut().insert(
+                bx.content.clone(),
+                Function {
+                    declaration: id,
+                    returns,
+                },
+            );
         }
-
         Ok(())
+    }
+
+    // fn insert_connection(&self, id: usize, dir: Direction, pos: Position, io: IO) {
+    //     let mut connections = self.connections.borrow_mut();
+    //     if !connections.contains_key(&(id, dir)) {
+    //         connections.insert((id, dir), io);
+
+    //         let (end_pos, end_dir) = self.trace_line(pos, dir);
+    //         if let Some(end_pos) = end_pos {
+    //             let end_id = *self
+    //                 .connectors
+    //                 .get(&(end_pos, end_dir))
+    //                 .expect("end position must have a connector");
+    //             connections.insert((end_id, end_dir), io.rev());
+    //         }
+    //     }
+    // }
+
+    fn trace_connections(&mut self) {
+        for (id, bx) in &self.boxes {
+            for (conn_dir, &conn) in bx.connections.iter() {
+                let (end_pos, end_dir) = self.trace_line(conn, conn_dir);
+
+                if let Some(end_pos) = end_pos {
+                    let end_id = self
+                        .connectors
+                        .get(&(end_pos, end_dir))
+                        .expect("All connectors have been found");
+
+                    let mut conns = self.connections.borrow_mut();
+                    conns.insert((id, *end_id));
+                    conns.insert((*end_id, id));
+                } else {
+                    self.free_returns.push(Return::new(id, conn_dir, end_dir));
+                }
+            }
+        }
     }
 
     fn insert_connected(
@@ -342,6 +342,19 @@ impl<'src> BoxParser<'src> {
                 },
 
                 tee @ ('┴' | '├' | '┬' | '┤') => {
+                    if [
+                        Direction::North,
+                        Direction::East,
+                        Direction::South,
+                        Direction::West,
+                    ]
+                    .into_iter()
+                    .any(|dir| self.connectors.contains_key(&(pos, dir)))
+                    {
+                        // this connector is part of a box
+                        continue;
+                    }
+
                     let connections = match tee {
                         '┬' => Connections::with(None, Some(pos), Some(pos), Some(pos)),
                         '┤' => Connections::with(Some(pos), None, Some(pos), Some(pos)),
@@ -718,8 +731,8 @@ mod tests {
         // let boxes = parser.parse_tokens().unwrap();
         // assert_eq!(boxes.len(), 4);
 
-        let mut parser = BoxParser::new(TEE);
-        let boxes = parser.parse().unwrap();
-        assert_eq!(boxes.len(), 4, "{boxes:?}");
+        // let mut parser = BoxParser::new(TEE);
+        // let boxes = parser.parse().unwrap();
+        // assert_eq!(boxes.len(), 4, "{boxes:?}");
     }
 }
